@@ -12,8 +12,26 @@ import psycopg2
 from psycopg2 import sql
 from database import Database
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
+async def get_db_connection():
+    return await asyncpg.connect(
+        os.getenv("DB_URL"),
+        command_timeout=60  # Увеличиваем таймаут запросов
+    )
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10)
+)
+async def safe_db_query(query, *args):
+    conn = await get_db_connection()
+    try:
+        return await conn.fetch(query, *args)
+    finally:
+        await conn.close()
+
 
 async def handle_channel_post(update: Update, context: CallbackContext):
     try:
@@ -165,9 +183,9 @@ async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(welcome_text0, reply_markup=reply_markup, parse_mode="HTML")
     await asyncio.sleep(0.5)
     await update.message.reply_text(welcome_text00, reply_markup=reply_markup, parse_mode="HTML")
-    await asyncio.sleep(3)
+    await asyncio.sleep(1)
     await update.message.reply_text(welcome_text1, reply_markup=reply_markup, parse_mode="HTML")
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
     await update.message.reply_text(welcome_text2, reply_markup=reply_markup, parse_mode="HTML")
    
 
@@ -409,9 +427,9 @@ async def send_letters_and_words(update: Update, context: CallbackContext, user_
         if current_index == 0:
             category_text0 = """<b>📚 Прежде чем начать изучение Хангыля, важно запомнить несколько правил:</b>"""
             category_text1 = """
-            1. Буквы формируются слева-направо и сверху-вниз. Например, ㄴ (н) + ㅕ (ё/йо) + ㄴ (н) = 년 (нйон) — год.
-            2. Не пугайтесь, если видите на письме, что перед гласной стоит кружочек. Это норма для написания гласных в начале слова. Никак не влияет на произношение. Например, в слове 아버님 — «отец».
-            3. Помните, что произношение согласной зависит от положения в слове/слоге, «соседства» с другими буквами.
+    1. Буквы формируются слева-направо и сверху-вниз. Например, ㄴ (н) + ㅕ (ё/йо) + ㄴ (н) = 년 (нйон) — год.
+    2. Не пугайтесь, если видите на письме, что перед гласной стоит кружочек. Это норма для написания гласных в начале слова. Никак не влияет на произношение. Например, в слове 아버님 — «отец».
+    3. Помните, что произношение согласной зависит от положения в слове/слоге, «соседства» с другими буквами.
             """
             category_text2 ="""<b>Теперь давай начнем с первых букв:</b>"""
             await update.message.reply_text(category_text0, parse_mode="HTML")
@@ -1033,16 +1051,15 @@ async def clear_user_state(context: CallbackContext):
             del context.user_data[key]
 
 
-async def get_letters_data():   # просто избегает ошибок в Гугл таблице подключенной
+async def get_letters_data():
+    conn = await get_db_connection()
     try:
-        letters_data = sheet.get_all_records()
-        if not letters_data:
-            raise ValueError("Данные в таблице отсутствуют.")
-        return letters_data
+        return await conn.fetch("SELECT * FROM korean_alphabet ORDER BY id")
     except Exception as e:
-        print(f"Ошибка при получении данных из Google Sheets: {e}")
+        print(f"Ошибка при получении данных из БД: {e}")
         return None
-
+    finally:
+        await conn.close()
 
 
 
@@ -1060,7 +1077,7 @@ async def reset_score(update: Update, context: CallbackContext):
 
 
 # Создание и запуск бота
-app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
+app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).connect_timeout(30).pool_timeout(30).build()
 
 # Регистрация обработчиков в правильном порядке
 app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))  # 1. Обработчик канальных постов
