@@ -1,0 +1,6 @@
+python-telegram-bot
+gspread
+google-auth
+asyncio
+pytz
+psycopg2-binary
