@@ -59,7 +59,6 @@ phrases_data = []
 
 
 # Настройка
-BOT_TOKEN = "7600695452:AAFZlDylRBpBv_-EAX5F_CVQZho6Jaf1WaQ"
 SOURCE_CHANNEL_ID = "@topik2prep"  # Канал-источник
 
 
