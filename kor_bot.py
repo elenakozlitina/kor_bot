@@ -1,4 +1,4 @@
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -7,30 +7,83 @@ from google.oauth2.service_account import Credentials
 import random
 import asyncio
 import logging
+import json 
 import os
-import psycopg2
-from psycopg2 import sql
-from database import Database
+import asyncpg
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-load_dotenv()
-async def get_db_connection():
-    return await asyncpg.connect(
-        os.getenv("DB_URL"),
-        command_timeout=60  # Увеличиваем таймаут запросов
-    )
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10)
-)
-async def safe_db_query(query, *args):
-    conn = await get_db_connection()
-    try:
-        return await conn.fetch(query, *args)
-    finally:
-        await conn.close()
+load_dotenv()
+
+# Инициализация базы данных
+
+class Database:
+    def __init__(self):
+        self.pool = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(os.getenv("DB_URL"))
+
+    async def get_user(self, user_id: int):
+        return await self.pool.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+
+    async def create_user(self, user_id: int):
+        await self.pool.execute("""
+            INSERT INTO users (user_id) VALUES ($1) 
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id)
+
+    async def update_progress(self, user_id: int, score: int, current_letter_index: int):
+        await self.pool.execute("""
+            UPDATE users 
+            SET score = score + $1, current_letter_index = $2 
+            WHERE user_id = $3
+        """, score, current_letter_index, user_id)
+
+    async def add_learned_word(self, user_id: int, word: str, translation: str, level: int, image_url: str = None):
+        await self.pool.execute("""
+            INSERT INTO learned_words (user_id, word, translation, level, image_url)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user_id, word) DO NOTHING
+        """, user_id, word, translation, level, image_url)
+
+    async def get_learned_words(self, user_id: int, level: int = None):
+        query = "SELECT * FROM learned_words WHERE user_id = $1"
+        params = [user_id]
+        if level is not None:
+            query += " AND level = $2"
+            params.append(level)
+        return await self.pool.fetch(query, *params)
+
+    async def delete_subscriber(self, user_id: int):
+        await self.pool.execute("DELETE FROM subscriptions WHERE user_id = $1", user_id)
+
+    async def add_subscriber(self, user_id: int):
+        try:
+            # Добавляем пользователя в таблицу users (если его ещё нет)
+            await self.pool.execute("""
+                INSERT INTO users (user_id) 
+                VALUES ($1) 
+                ON CONFLICT (user_id) DO NOTHING
+            """, user_id)
+
+            # Добавляем пользователя в таблицу subscriptions
+            await self.pool.execute("""
+                INSERT INTO subscriptions (user_id) 
+                VALUES ($1) 
+                ON CONFLICT (user_id) DO NOTHING
+            """, user_id)
+        except Exception as e:
+            logging.error(f"Ошибка при добавлении подписчика: {e}")
+
+    async def get_subscribers(self):
+        return await self.pool.fetch("SELECT user_id FROM subscriptions")
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+db = Database()
+
 
 
 async def handle_channel_post(update: Update, context: CallbackContext):
@@ -39,21 +92,18 @@ async def handle_channel_post(update: Update, context: CallbackContext):
         if update.channel_post.chat.username.lower() != "topik2prep":
             return
             
-        db = Database()
-        subscribers = db.get_subscribers()
+        subscribers = await db.get_subscribers()  # Асинхронный вызов
         
         for user_id in subscribers:
             try:
                 await context.bot.forward_message(
-                    chat_id=user_id,
+                    chat_id=user_id['user_id'],  # Исправлено: user_id из базы данных
                     from_chat_id=update.channel_post.chat.id,
                     message_id=update.channel_post.message_id
                 )
             except Exception as e:
                 print(f"Ошибка для {user_id}: {e}")
-                db.delete_subscriber(user_id)
-        
-        db.close()
+                await db.delete_subscriber(user_id['user_id'])  # Асинхронный вызов
         
     except Exception as e:
         print(f"Общая ошибка: {e}")
@@ -79,31 +129,30 @@ phrases_data = []
 # Настройка
 SOURCE_CHANNEL_ID = "@topik2prep"  # Канал-источник
 
+async def unsubscribe(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    await db.delete_subscriber(user_id)  # Асинхронный вызов
+    await update.message.reply_text("Вы отписались от рассылки 😢")
+
 
 async def send_daily_post(context: CallbackContext):
-    db = Database()
     try:
         # Получаем последний пост из канала
         channel_id = "@topik2prep"
         posts = await context.bot.get_chat(chat_id=channel_id, limit=1)
         
         # Получаем список подписчиков
-        subscribers = db.get_subscribers()
+        subscribers = await db.get_subscribers()  # Асинхронный вызов
         
         # Пересылаем пост всем подписчикам
         for user_id in subscribers:
             await context.bot.forward_message(
-                chat_id=user_id,
+                chat_id=user_id['user_id'],  # Исправлено: user_id из базы данных
                 from_chat_id=channel_id,
                 message_id=posts[0].message_id
             )
     except Exception as e:
         print(f"Ошибка: {e}")
-    finally:
-        db.close()
-
-
-
 
 # Словарь для подписчиков
 subscribers = set()
@@ -130,19 +179,13 @@ async def return_to_menu(update: Update, context: CallbackContext):
         del context.user_data["mode"]
 
 
-
-# Создайте команду /unsubscribe для отписки:
-async def unsubscribe(update: Update, context: CallbackContext):
-    db.delete_subscriber(update.effective_user.id)
-    await update.message.reply_text("Вы отписались от рассылки 😢")
-
-# Приветственное сообщение
 async def start(update: Update, context: CallbackContext):
-    db = Database()
-    db.add_subscriber(update.effective_user.id)  # <-- Добавляем пользователя в подписчики
-    db.close()
-    welcome_text0= """ <b>Привет! 👋 </b> """
-    welcome_text00= """
+    user_id = update.effective_user.id
+    await db.add_subscriber(user_id)
+    
+    
+    welcome_text0 = """ <b>Привет! 👋 </b> """
+    welcome_text00 = """
 <b>Добро пожаловать в ProMol — твоего личного помощника в изучении корейского языка!</b>  🇰🇷🎉
 Здесь ты сможешь не только учить корейский, но и погрузиться в культуру, язык и традиции Кореи. 
 Вот что тебя ждет:
@@ -172,6 +215,7 @@ async def start(update: Update, context: CallbackContext):
     welcome_text2 = """ 
 <b>С чего начнем?👇
 Выбери категорию, и мы начнем твое путешествие в мир корейского языка!</b> """
+    
     # Создаем клавиатуру с кнопками
     keyboard = [
         ["Хангыль","Подготовка к ТОПИКу"],
@@ -187,7 +231,6 @@ async def start(update: Update, context: CallbackContext):
     await update.message.reply_text(welcome_text1, reply_markup=reply_markup, parse_mode="HTML")
     await asyncio.sleep(2)
     await update.message.reply_text(welcome_text2, reply_markup=reply_markup, parse_mode="HTML")
-   
 
 
 async def handle_spelling_input(update: Update, context: CallbackContext):
@@ -263,8 +306,10 @@ async def handle_message(update: Update, context: CallbackContext):
             return  # Сообщение обработано, выходим
 
         # Инициализируем прогресс пользователя, если его нет
-        if user_id not in user_progress:
-            user_progress[user_id] = {"learned_words": [], "score": 0}
+        user = await db.get_user(user_id)
+        if not user:
+            await db.create_user(user_id)
+            user = await db.get_user(user_id)
 
         # Проверяем состояние ввода буквы/слова
         if "awaiting_input" in context.user_data:  
@@ -309,7 +354,8 @@ async def handle_message(update: Update, context: CallbackContext):
 
         elif user_input.lower() == "играть":
             await handle_learn_from_dictionary(update, context)
-
+        elif user_input.lower() == "очистить словарь":
+            await handle_clear_dictionary(update, context)
         elif "awaiting_spelling" in context.user_data:
             await handle_spelling_input(update, context)  # Исправлено название
 
@@ -413,14 +459,20 @@ async def handle_what_is_letter(update: Update, context: CallbackContext): # Ч�
 
 
 
-async def send_letters_and_words(update: Update, context: CallbackContext, user_id): # Изучать буквы 
+async def send_letters_and_words(update: Update, context: CallbackContext, user_id: int):
     letters_data = sheet.get_all_records()
     
-    # Инициализация прогресса только при первом запуске
-    if "current_letter_index" not in user_progress[user_id]:
-        user_progress[user_id]["current_letter_index"] = 0
-        
-    current_index = user_progress[user_id]["current_letter_index"]
+    # Получаем данные пользователя из базы данных
+    user = await db.get_user(user_id)
+    if not user:
+        await db.create_user(user_id)
+        user = await db.get_user(user_id)
+    
+    current_index = user['current_letter_index']
+    
+    if current_index >= len(letters_data):
+        await update.message.reply_text("Вы изучили все буквы! 🎉")
+        return
 
     # Определяем категорию букв
     if current_index < 10:  # Обычные гласные (2-11 строки)
@@ -509,6 +561,13 @@ async def send_letters_and_words(update: Update, context: CallbackContext, user_
         # Запрашиваем ввод буквы
         await update.message.reply_text("➡️ Напиши эту букву:", parse_mode="HTML")
 
+        # Обновляем прогресс в БД
+        await db.update_progress(
+            user_id=user_id,
+            score=0,  # или добавляем очки если нужно
+            current_letter_index=current_index + 1
+        )
+
     except Exception as e:
         print(f"Ошибка отправки: {e}")
         await update.message.reply_text("⚠️ Произошла ошибка при загрузке материалов")
@@ -553,9 +612,16 @@ async def check_user_response(update: Update, context: CallbackContext):
     elif "awaiting_input" in context.user_data and context.user_data["awaiting_input"] == "AWAITING_WORD":
         if user_input == correct_word:  # Сравниваем без приведения к нижнему регистру
             await update.message.reply_text("✅ Правильно! 🎉")
+            user = await db.get_user(user_id)
+            if not user:
+                await db.create_user(user_id)
+                user = await db.get_user(user_id)
 
-            # Переходим к следующей букве
-            user_progress[user_id]["current_letter_index"] += 1
+            await db.update_progress(
+                user_id=user_id,
+                score=0,  # или добавляем очки, если нужно
+                current_letter_index=user['current_letter_index'] + 1
+            )
             await send_letters_and_words(update, context, user_id)
         else:
             await update.message.reply_text(f"❌ Неправильно. Попробуй ещё раз: Напиши слово: {correct_word}")
@@ -564,51 +630,96 @@ async def check_user_response(update: Update, context: CallbackContext):
 
 
 
+# Модифицированные функции
 async def handle_my_dictionary(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
 
-    # Проверяем, есть ли прогресс у пользователя
-    if user_id not in user_progress or not user_progress[user_id].get("learned_words"):
+    async with db.pool.acquire() as conn:
+        # Получаем уникальные уровни изученных слов
+        levels = await conn.fetch(
+            "SELECT DISTINCT wt.level FROM words_table wt JOIN users u ON wt.id::TEXT = ANY(u.learned_words) WHERE u.user_id = $1",
+            user_id
+        )
+
+    if not levels:
         await update.message.reply_text("Вы пока не изучили ни одного слова. 😢")
         return
 
-    # Создаем клавиатуру с уровнями
-    levels = set(word['level'] for word in user_progress[user_id]["learned_words"])
-    keyboard = [[str(level)] for level in sorted(levels)]
-    keyboard.append(["Выйти"])  # Добавляем кнопку "Выйти"
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    # Устанавливаем состояние, что пользователь ожидает выбора уровня
+    keyboard = [[str(level['level'])] for level in sorted(levels, key=lambda x: x['level'])]
+    keyboard.append(["Выйти"])
+    
+    await update.message.reply_text(
+        "Выберите уровень слов:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
     context.user_data["awaiting_dictionary_level"] = True
-
-    await update.message.reply_text("Выберите уровень слов:", reply_markup=reply_markup)
-
 
 async def handle_my_dictionary_level(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     level = int(update.message.text)
+
+    async with db.pool.acquire() as conn:
+        # Получаем все слова уровня из БД
+        words = await conn.fetch(
+            "SELECT * FROM words_table WHERE level = $1", 
+            level
+        )
+        
+        # Получаем изученные слова пользователя для этого уровня
+        learned_words = await conn.fetch(
+            """
+            SELECT wt.* 
+            FROM words_table wt
+            JOIN users u ON wt.id::TEXT = ANY(u.learned_words) 
+            WHERE u.user_id = $1 AND wt.level = $2
+            """,
+            user_id, level
+        )
+
+    if not learned_words:
+        await update.message.reply_text(f"На уровне {level} пока нет изученных слов.")
+        return
+
+    # Рассчитываем статистику
+    total_learned = len(learned_words)
+    offset = max(0, total_learned - 20)
+    last_20_words = learned_words[-20:]
+
+    # Формируем сообщение
+    word_list = "\n".join(
+        [f"{idx+1+offset}. {w['word']} — {w['translation']}" 
+         for idx, w in enumerate(last_20_words)]
+    )
     
-    # Сохраняем уровень и слова в контекст
-    context.user_data.update({
-        "current_level": level,
-        "current_words": [w for w in user_progress[user_id]["learned_words"] if w["level"] == level]
-    })
-    
-    # Формируем список слов
-    word_list = "\n".join([f"{w['word']} — {w['translation']}" for w in context.user_data["current_words"]])
-    
-    keyboard = [["Играть", "Назад 🔙"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        f"📚 Уровень {level}\n\n"
-        f"📊 Изучено слов: {len(context.user_data['current_words'])}\n\n"
-        f"🔠 Ваши слова:\n{word_list}\n\n"
-        "Нажмите 'Играть' чтобы начать тренировку!",
-        reply_markup=reply_markup,
-        parse_mode="HTML"
+    stats_message = (
+        f"📚 Уровень {level}\n"
+        f"📊 Изучено слов: {total_learned}\n\n"
+        f"📖 Последние 20 изученных слов:\n{word_list}"
     )
 
+    await update.message.reply_text(
+        stats_message,
+        reply_markup=ReplyKeyboardMarkup(
+            [["Играть", "Очистить словарь", "Выйти"]], 
+            resize_keyboard=True
+        )
+    )
+
+    # Сохраняем контекст для возможной игры
+    context.user_data.update({
+        "current_level": level,
+        "current_words": learned_words
+    })
+
+async def handle_clear_dictionary(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    await clear_learned_words(user_id)
+    
+    await update.message.reply_text(
+        "🗑 Ваш словарь успешно очищен!",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await return_to_menu(update, context)
 
 
 
@@ -616,7 +727,6 @@ async def handle_learn_new_words(update: Update, context: CallbackContext):
     # Создаем клавиатуру с уровнями и кнопкой "Выйти"
     keyboard = [["1", "2", "3"], ["4", "5", "6"], ["Выйти"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
     await update.message.reply_text("Выберите уровень слов или нажмите 'Выйти':", reply_markup=reply_markup)
 
 async def handle_learn_new_words_level(update: Update, context: CallbackContext):
@@ -633,102 +743,137 @@ async def handle_learn_new_words_level(update: Update, context: CallbackContext)
 
     user_id = update.message.from_user.id
 
-    # Получаем слова из листа "Словарь"
-    words_sheet = spreadsheet.worksheet("Словарь")
-    words_data = words_sheet.get_all_records()
+    try:
+        async with db.pool.acquire() as conn:
+            # Получаем слова уровня
+            words = await conn.fetch(
+                "SELECT * FROM words_table WHERE level = $1 ORDER BY st_imp DESC, random()",
+                level
+            )
 
-    # Проверяем, что данные содержат ключ 'Уровень'
-    if not words_data or 'Уровень' not in words_data[0]:
-        await update.message.reply_text("Ошибка: данные в таблице 'Словарь' некорректны. Проверьте структуру.")
-        return
+            if not words:
+                await update.message.reply_text(f"На уровне {level} пока нет слов. 😢")
+                return
 
-    # Фильтруем слова по уровню
-    words = [word for word in words_data if word['Уровень'] == level]
+            # Получаем данные пользователя
+            user_data = await conn.fetchrow(
+                """SELECT learned_words, 
+                COALESCE(learning_progress, '{}'::JSONB) as learning_progress 
+                FROM users WHERE user_id = $1""",
+                user_id
+            )
+            
+            # Инициализируем прогресс
+            learning_progress = user_data['learning_progress'] if user_data else {}
+            if isinstance(learning_progress, str):  # Защита от строкового представления
+                try:
+                    learning_progress = json.loads(learning_progress)
+                except:
+                    learning_progress = {}
 
-    if not words:
-        await update.message.reply_text(f"На уровне {level} пока нет слов. 😢")
-        return
+            level_progress = learning_progress.get(str(level), {'index': 0, 'words': []})
+            
+            learned_words = user_data['learned_words'] if user_data else []
+            learned_set = set(learned_words)
 
-    # Исключаем уже изученные слова
-    if user_id in user_progress and "learned_words" in user_progress[user_id]:
-        learned_words = [word['word'] for word in user_progress[user_id]["learned_words"] if word['level'] == level]
-        words = [word for word in words if word['Слово'] not in learned_words]
+            # Фильтруем новые слова
+            filtered_words = [
+                word for word in words 
+                if str(word['id']) not in learned_set
+            ]
 
-    if not words:
-        await update.message.reply_text(f"Вы уже изучили все слова уровня {level}! �")
-        return
+            if not filtered_words:
+                await update.message.reply_text(f"Вы уже изучили все слова уровня {level}! 🎉")
+                return
 
-    # Отправляем первое слово
-    context.user_data["current_words"] = words
-    context.user_data["current_word_index"] = 0
-    await send_word(update, context)
-    context.user_data["mode"] = "learn"
+            # Начинаем с сохраненной позиции
+            start_index = level_progress.get('index', 0)
+            if start_index >= len(filtered_words):
+                start_index = 0
 
+            # Сохраняем контекст
+            context.user_data.update({
+                "current_words": filtered_words,
+                "current_word_index": start_index,
+                "current_level": level
+            })
 
+            # Отправляем первое слово
+            await send_word(update, context)
+            context.user_data["mode"] = "learn"
 
+    except Exception as e:
+        logging.error(f"Ошибка при работе с базой данных: {e}")
+        await update.message.reply_text("⚠ Произошла ошибка. Попробуйте позже.")
 
-# Добавляем в начало константы
-INTERACTIVE_CHECK_INTERVAL = 3  # Проверка каждые 3 слова
-
-
-async def send_word(update: Update, context: CallbackContext): # Учить новые слова 
-    words = context.user_data["current_words"]
-    index = context.user_data["current_word_index"]
-    context.user_data["words_learned"] = context.user_data.get("words_learned", 0) + 1
+async def send_word(update, context):
+    user_id = update.message.from_user.id
+    index = context.user_data.get("current_word_index", 0)
+    words = context.user_data.get("current_words", [])
+    level = context.user_data.get("current_level")
 
     if index >= len(words):
-        await update.message.reply_text("Вы изучили все слова на этом уровне! 🎉")
-        # Очищаем состояние после завершения
-        del context.user_data["current_words"]
-        del context.user_data["current_word_index"]
-        del context.user_data["correct_translation"]
-        del context.user_data["current_options"]
-        if "awaiting_retry" in context.user_data:
-            del context.user_data["awaiting_retry"]
+        await update.message.reply_text("Вы изучили все слова! 🎉")
         return
 
+    # Сохраняем прогресс
+    async with db.pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                UPDATE users 
+                SET learning_progress = 
+                    COALESCE(learning_progress, '{}'::JSONB) || 
+                    jsonb_build_object($1::TEXT, 
+                        jsonb_build_object(
+                            'index', $2::INTEGER,
+                            'words', $3::JSONB
+                        )
+                    )
+                WHERE user_id = $4
+            """, 
+            str(level),
+            index,
+            json.dumps([str(w['id']) for w in words[:index]]),
+            user_id)
+        except Exception as e:
+            logging.error(f"Ошибка сохранения прогресса: {e}")
+
+    
     word = words[index]
-    correct_translation = word['Перевод']
-    image_url = word.get('Изображение', '').strip()  # Получаем URL изображения
-
+    correct_translation = word['translation']
+    image_url = (word.get('image') or '').strip()
+    
     try:
-        # Отправляем изображение если есть URL
         if image_url:
-            await update.message.reply_photo(
-                photo=image_url,
-                caption=f"<b>Изучим слово:</b> {word['Слово']}",
-                parse_mode="HTML"
-            )
+            await update.message.reply_photo(photo=image_url, caption=f"<b>Изучим слово:</b> {word['word']}", parse_mode="HTML")
         else:
-            await update.message.reply_text(
-                f"<b>Изучим слово:</b> {word['Слово']}", 
-                parse_mode="HTML"
-            )
-
-        # Создаем варианты ответа
-        other_words = [w['Перевод'] for w in words if w['Перевод'] != correct_translation]
-        random.shuffle(other_words)
-        options = [correct_translation] + other_words[:2]
+            await update.message.reply_text(f"<b>Изучим слово:</b> {word['word']}", parse_mode="HTML")
+        
+        all_translations = [w['translation'] for w in words if w['translation'] != correct_translation]
+        random.shuffle(all_translations)
+        options = [correct_translation] + all_translations[:2]
         random.shuffle(options)
-
-        # Сохраняем правильный ответ и варианты
-        context.user_data["correct_translation"] = correct_translation
-        context.user_data["current_options"] = options
-
-        # Создаем клавиатуру
-        keyboard = [["1", "2", "3"], ["Выйти"]]
+        
+        context.user_data.update({
+            "correct_translation": correct_translation,
+            "current_options": options
+        })
+        
+        keyboard = [[str(i + 1) for i in range(len(options))], ["Выйти"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-        # Формируем сообщение с вариантами
+        
         options_text = "\n".join(f"{i+1}. {option}" for i, option in enumerate(options))
         await update.message.reply_text(
-            f"<b>Слово:</b> {word['Слово']}\n\n"
+            f"<b>Слово:</b> {word['word']}\n\n"
             f"<b>Варианты:</b>\n{options_text}\n\n"
             f"Выбери правильный перевод (введи номер) или нажми 'Выйти':\n\n"
-            f"Прогресс: {index + 1} из {len(words)} слов 🚀", 
+            f"Прогресс: {index + 1} из {len(words)} слов 🚀",
             parse_mode="HTML",
             reply_markup=reply_markup
         )
+        
+        # Обновление индекса в контексте вместо БД
+        context.user_data["current_word_index"] = index + 1
 
     except Exception as e:
         print(f"Ошибка отправки: {e}")
@@ -736,24 +881,27 @@ async def send_word(update: Update, context: CallbackContext): # Учить но
 
 
 
-async def check_word_translation(update: Update, context: CallbackContext): # Проверка перевода слова в "Учить новые слова"
+# Добавляем в начало константы
+INTERACTIVE_CHECK_INTERVAL = 3  # Проверка каждые 3 слова
+
+async def check_word_translation(update: Update, context: CallbackContext):
     if context.user_data.get("mode") != "learn":
-        return False  # Режим не активен, сообщение не обработано
+        return False
+
     user_input = update.message.text.strip()
+    user_id = update.message.from_user.id
 
     if user_input.lower() == "выйти":
-        context.user_data["mode"] = None  # Выходим из режима
+        context.user_data["mode"] = None
         await return_to_menu(update, context)
-        return 
- 
-    # Проверяем наличие необходимых данных
+        return True
+
     if "current_options" not in context.user_data or "correct_translation" not in context.user_data:
         await update.message.reply_text("Ошибка: данные не найдены. Попробуй ещё раз.")
-        return
+        return True
 
     correct_translation = context.user_data["correct_translation"]
     options = context.user_data["current_options"]
-    user_id = update.message.from_user.id
 
     try:
         selected_option = int(user_input) - 1
@@ -763,71 +911,79 @@ async def check_word_translation(update: Update, context: CallbackContext): # П
 
         selected_translation = options[selected_option]
 
-        # Инициализация прогресса пользователя
-        if user_id not in user_progress:
-            user_progress[user_id] = {
-                "learned_words": [],
-                "score": 0,
-                "current_letter_index": 0
-            }
+        async with db.pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            if not user:
+                await conn.execute("INSERT INTO users(user_id) VALUES($1)", user_id)
+                user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
-        # Если ответ правильный
-        if selected_translation == correct_translation:
-            user_progress[user_id]["score"] += 10
-        
-            # Получаем текущее слово
-            current_word = context.user_data["current_words"][context.user_data["current_word_index"]]
-            
-            # Формируем данные слова
-            word_data = {
-                "word": current_word['Слово'],
-                "translation": correct_translation,
-                "level": current_word['Уровень'],
-                "image": current_word.get('Изображение', '')
-            }
-            
-            # Добавляем слово в словарь если его там нет
-            if word_data not in user_progress[user_id]["learned_words"]:
-                user_progress[user_id]["learned_words"].append(word_data)
-            
-            # Уведомление и переход к следующему слову
-            await update.message.reply_text(
-                f"""✅ Правильно! 
-                Слово добавлено в твой словарь!\n"""
-                f"💯 Твой счёт: {user_progress[user_id]['score']} баллов."
-            )
-            
-                # Убираем прямой вызов start_spelling_check
-            context.user_data["current_word_index"] += 1
-            if context.user_data["current_word_index"] % 3 == 0:
-                await start_spelling_check(update, context)  # Теперь здесь устанавливается режим
+            if selected_translation == correct_translation:
+                current_word = context.user_data["current_words"][context.user_data["current_word_index"] - 1]
+                
+                # Обновляем прогресс в базе данных
+                await conn.execute(
+                    """
+                    UPDATE users 
+                    SET 
+                        score = COALESCE(score, 0) + 10,
+                        learned_words = array_append(learned_words, $1)
+                    WHERE user_id = $2
+                    """,
+                    str(current_word['id']),  # Добавляем ID слова в learned_words
+                    user_id
+                )
+
+                await update.message.reply_text(
+                    f"✅ Правильно! Слово добавлено в твой словарь!\n"
+                    f"💯 Твой счёт: {user.get('score', 0) + 10} баллов."
+                )
+
+                if context.user_data["current_word_index"] % 3 == 0:
+                    await start_spelling_check(update, context)
+                else:
+                    await send_word(update, context)
+
             else:
-                await send_word(update, context)
-
-        # Если ответ неверный
-        else:
-            user_progress[user_id]["score"] -= 5
-            hint = f"Подсказка: первая буква — '{correct_translation[0]}'."
-            await update.message.reply_text(
-                f"❌ Неправильно. {hint}\n"
-                f"Попробуй ещё раз:"
-            )
-            context.user_data["awaiting_retry"] = True
+                await conn.execute(
+                    "UPDATE users SET score = COALESCE(score, 0) - 5 WHERE user_id = $1",
+                    user_id
+                )
+                hint = f"Подсказка: первая буква — '{correct_translation[0]}'."
+                await update.message.reply_text(
+                    f"❌ Неправильно. {hint}\nПопробуй ещё раз:"
+                )
 
     except (ValueError, IndexError):
         await update.message.reply_text("Пожалуйста, выбери номер правильного варианта.")
+    except Exception as e:
+        logging.error(f"Ошибка в check_word_translation: {e}")
+        await update.message.reply_text("⚠ Произошла ошибка. Попробуйте позже.")
+
     return True
+
 
 async def start_spelling_check(update: Update, context: CallbackContext): # Проверка каждого 3-4 слова изученного подряд
     # Получаем последние 3-4 изученных слова
     user_id = update.message.from_user.id
-    learned_words = user_progress[user_id].get("learned_words", [])[-INTERACTIVE_CHECK_INTERVAL:]
     
-    if not learned_words:
+    async with db.pool.acquire() as conn:
+        words = await conn.fetch(
+            """
+            SELECT wt.* 
+            FROM words_table wt
+            JOIN users u ON wt.id::TEXT = ANY(u.learned_words)
+            WHERE u.user_id = $1
+            ORDER BY random()
+            LIMIT $2
+            """,
+            user_id, INTERACTIVE_CHECK_INTERVAL
+        )
+
+    if not words:
         return
 
-    # Выбираем случайное слово для проверки
-    check_word = random.choice(learned_words)
+    check_word = random.choice(words)
+
     context.user_data["spelling_check"] = {
         "word": check_word['word'],
         "translation": check_word['translation'],
@@ -855,23 +1011,58 @@ async def start_spelling_check(update: Update, context: CallbackContext): # Пр
 # Новая функция для обработки ввода при проверке написания
 
 
+async def get_learned_words(user_id: int, level: int = None):
+    async with db.pool.acquire() as conn:
+        query = """
+            SELECT wt.* 
+            FROM words_table wt
+            JOIN users u ON wt.id::TEXT = ANY(u.learned_words)
+            WHERE u.user_id = $1
+        """
+        params = [user_id]
+        
+        if level:
+            query += " AND wt.level = $2"
+            params.append(level)
+            
+        return await conn.fetch(query, *params)
+
+async def clear_learned_words(user_id: int):
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET learned_words = '{}' WHERE user_id = $1",
+            user_id
+        )
+
 
 async def handle_learn_from_dictionary(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    
-    # Проверяем наличие данных
-    if "current_words" not in context.user_data or not context.user_data["current_words"]:
+
+    # Загружаем слова из базы данных (то, что пользователь уже учил)
+    learned_words = await get_learned_words_from_db(user_id)
+
+    # Загружаем текущий список слов из Google Sheets или других источников
+    sheet_words = context.user_data.get("current_words", [])
+
+    # Объединяем оба списка, исключая дубликаты
+    all_words = {word["word"]: word for word in (sheet_words + learned_words)}.values()
+    all_words = list(all_words)  # Преобразуем обратно в список
+
+    if not all_words:
         await update.message.reply_text("❌ Нет слов для игры. Выберите другой уровень.")
         return
-    
-    # Инициализируем игровые параметры
+
+    # Перемешиваем слова для случайного порядка
+    random.shuffle(all_words)
+
+    # Сохраняем обновленный список слов
     context.user_data.update({
-        "game_words": random.sample(context.user_data["current_words"], len(context.user_data["current_words"])), 
+        "game_words": all_words,
         "current_game_index": 0,
         "correct_answers": 0,
         "in_game": True
     })
-    
+
     # Начало игры
     await update.message.reply_text(
         "🎮 Начинаем игру 'Переводчик'!\n\n"
@@ -883,15 +1074,15 @@ async def handle_learn_from_dictionary(update: Update, context: CallbackContext)
         "Для выхода нажми 'Стоп 🛑'",
         reply_markup=ReplyKeyboardMarkup([["Стоп 🛑"]], resize_keyboard=True)
     )
-    
+
     await send_next_game_word(update, context)
     context.user_data["mode"] = "game"
 
 
 
 async def send_next_game_word(update: Update, context: CallbackContext):
-    words = context.user_data["game_words"]
-    index = context.user_data["current_game_index"]
+    words = context.user_data.get("game_words", [])
+    index = context.user_data.get("current_game_index", 0)
 
     if index >= len(words):
         await finish_game(update, context)
@@ -900,13 +1091,15 @@ async def send_next_game_word(update: Update, context: CallbackContext):
     word = words[index]
     
     # Сохраняем текущие данные в context
-    context.user_data["current_word"] = word
-    context.user_data["current_correct"] = word["word"]
-    context.user_data["current_game_index"] += 1
+    context.user_data.update({
+        "current_word": word,
+        "current_correct": word["word"],
+        "current_game_index": index + 1
+    })
     
     await update.message.reply_text(
         f"Слово: {word['translation']}\n"
-        f"📝 Уровень: {word['level']}\n\n"
+        f"📝 Уровень: {word.get('level', 'Неизвестно')}\n\n"
         "✏️ Напиши перевод на корейском:",
         parse_mode="HTML"
     )
@@ -914,46 +1107,51 @@ async def send_next_game_word(update: Update, context: CallbackContext):
 
 async def check_game_translation(update: Update, context: CallbackContext):
     if context.user_data.get("mode") != "game":
-        return False  # Режим не активен, сообщение не обработано
-    user_input = update.message.text.strip()
+        return False  
+
+    user_input = update.message.text.strip() if update.message.text else ""
 
     # Проверяем, не нажал ли пользователь кнопку "Стоп"
     if user_input == "Стоп 🛑":
-        context.user_data["mode"] = None  # Выходим из режима
+        context.user_data["mode"] = None  
         await finish_game(update, context)
-        return
+        return True
 
     # Проверяем, есть ли текущее слово
     current_word = context.user_data.get("current_word")
     if not current_word:
         await update.message.reply_text("⚠ Ошибка! Нет текущего слова.")
-        return
+        return True
     
     correct = current_word["word"]
 
     # Проверяем, что ввод - не число
     if user_input.isdigit():
         await update.message.reply_text("✏️ Напиши перевод на корейском: ")
-        return
+        return True
 
     # Проверка ответа (без нормализации)
     if user_input == correct:
         context.user_data["correct_answers"] += 1
+        example_list = current_word.get("examples") or ["(Нет примера)"]
+        example = random.choice(example_list)
         msg = (
             f"✅ Правильно! Твой счет: {context.user_data['correct_answers']}\n"
             f"🇰🇷 Ответ: {correct}\n"
-            f"💡 Пример: {random.choice(current_word.get('examples', ['(Нет примера)']))}"
+            f"💡 Пример: {example}"
         )
     else:
+        romanization = current_word.get("romanization", "Нет транскрипции") or "Нет транскрипции"
         msg = (
             f"❌ Ошибка. Правильный ответ: {correct}\n"
-            f"📌 Запомни: {correct} ({current_word.get('romanization', 'Нет транскрипции')})"
+            f"📌 Запомни: {correct} ({romanization})"
         )
     
     await update.message.reply_text(msg)
-    await asyncio.sleep(1.5)  # Пауза для чтения ответа
+    await asyncio.sleep(1.5)  
     await send_next_game_word(update, context)
     return True
+
 
 async def finish_game(update: Update, context: CallbackContext):
     correct = context.user_data.get("correct_answers", 0)
@@ -980,15 +1178,9 @@ async def finish_game(update: Update, context: CallbackContext):
             resize_keyboard=True
         )
     )
-    if "mode" in context.user_data:
-        del context.user_data["mode"]
-    
-    
+
     # Сброс состояния игры
-    context.user_data.pop("game_words", None)
-    context.user_data.pop("current_game_index", None)
-    context.user_data.pop("correct_answers", None)
-    # Сброс только игровых данных
+    context.user_data.pop("mode", None)
     for key in ["game_words", "current_game_index", "correct_answers", "in_game"]:
         context.user_data.pop(key, None)
 
@@ -1005,16 +1197,12 @@ async def handle_choice(update: Update, context: CallbackContext):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         # Сохраняем прогресс, если он уже есть
-        if user_id not in user_progress:
-            user_progress[user_id] = {
-                "current_letter_index": 0,
-                "learned_words": [],
-                "score": 0
-            }
-        elif "current_letter_index" not in user_progress[user_id]:
-            user_progress[user_id]["current_letter_index"] = 0
-    
-        await update.message.reply_text(
+        user = await db.get_user(user_id)
+        if not user:
+            await db.create_user(user_id)
+            user = await db.get_user(user_id)
+
+        await update.message.reply_text( 
             """
     🌟 <b>Добро пожаловать в раздел "Хангыль"!</b> 🎓
 Здесь ты сможешь изучить корейский алфавит от А до Я (или, точнее, от ㄱ до ㅎ)! 🎉
@@ -1050,17 +1238,13 @@ async def clear_user_state(context: CallbackContext):
         if key in context.user_data:
             del context.user_data[key]
 
-
 async def get_letters_data():
-    conn = await get_db_connection()
     try:
-        return await conn.fetch("SELECT * FROM korean_alphabet ORDER BY id")
+        return await db.pool.fetch("SELECT * FROM korean_alphabet ORDER BY id")
     except Exception as e:
-        print(f"Ошибка при получении данных из БД: {e}")
+        logging.error(f"Ошибка при получении данных из БД: {e}")
+        await asyncio.sleep(1)  # Пауза перед повторной попыткой
         return None
-    finally:
-        await conn.close()
-
 
 
 
@@ -1075,14 +1259,42 @@ async def reset_score(update: Update, context: CallbackContext):
     else:
         await update.message.reply_text("У вас пока нет счёта для обнуления. 😢")
 
+# Основная функция
+async def main():
+    try:
+        # Инициализация базы данных
+        await db.connect()
 
-# Создание и запуск бота
-app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).connect_timeout(30).pool_timeout(30).build()
+        # Создание приложения
+        app = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
 
-# Регистрация обработчиков в правильном порядке
-app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))  # 1. Обработчик канальных постов
-app.add_handler(CommandHandler("start", start))                                          # 2. Команда /start
-app.add_handler(CommandHandler("unsubscribe", unsubscribe))                             # 3. Команда /unsubscribe
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))        # 4. Все текстовые сообщения
+        # Регистрация обработчиков
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))  # Добавьте эту строку
 
-app.run_polling()
+        # Запуск бота
+        await app.initialize()  # Инициализация приложения
+        await app.start()       # Запуск приложения
+        await app.updater.start_polling()  # Запуск polling
+
+        # Бесконечный цикл для поддержания работы бота
+        await asyncio.Event().wait()
+
+    except Exception as e:
+        logging.error(f"Произошла ошибка: {e}")
+    finally:
+        # Корректное завершение работы
+        if 'app' in locals():
+            await app.updater.stop()  # Остановка polling
+            await app.stop()          # Остановка приложения
+            await app.shutdown()     # Завершение работы приложения
+        await db.close()  # Закрытие соединения с базой данных
+
+# Запуск программы
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")
+    except Exception as e:
+        logging.error(f"Произошла ошибка: {e}")
